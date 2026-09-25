@@ -132,11 +132,26 @@ headway），故采用动态规划：正向 ``f_j(t) = |t-o_j| + min f_{j-1}(s)`
    一路口不晚于其 H 值"的道路中取下标最小者。不变式 t <= H(u, k) 保证
    每步必有可行道路、不会走入死路；E* 步后恰在 T* 到达终点，所得即
    (T*, E*) 路径中字典序最小者。
+
+单路口排队预测
+--------------
+:func:`compute_queue_forecast` 在**单个路口**上按秒模拟排队：给定信号周期、
+相位偏移与绿灯半开区间（语义与上文完全一致，含跨零点与整周期常绿）、半开
+预测范围 ``[forecast_from, forecast_to)``（最长 86400 秒）、每绿灯秒放行
+量、期初已在排队的车辆数与至多 1000 条到达批次 ``(time, vehicles)``。
+每个整数秒先把当秒到达的批次**按输入顺序**整体入队（同秒可多批），此时
+（到达后、放行前）的队列长度参与最大排队数统计；再判定当秒灯色，绿灯时
+按先到先走放行至多"每绿灯秒放行量"辆车，红灯不放行。队列用**批次计数**
+推进（队首元素为"批次下标 + 剩余辆数"，期初队列视为不属于任何批次的伪
+批次），放行时整批或部分地扣减队首计数，**不逐辆展开**；某批剩余计数
+归零的秒即该批最后一辆的通过秒，范围内未全部通过的批次记 ``None``。
+返回 ``(各批最后通过秒列表, 期末待行车辆数, 最大排队数)``。
 """
 
 from __future__ import annotations
 
 import heapq
+from collections import deque
 from typing import Iterable
 
 # 周期上限仅用于防御异常输入，一日之内足够覆盖任何实际信号周期。
@@ -148,6 +163,8 @@ MAX_CONVOY_VEHICLES = 50
 MAX_RESCHEDULE_TRIPS = 50
 MAX_ROUTE_INTERSECTIONS = 30
 MAX_ROADS = 120
+MAX_QUEUE_FORECAST_SECONDS = 86_400
+MAX_ARRIVAL_BATCHES = 1_000
 
 Interval = list[int]  # 长度为 2 的半开区间 [start, end)
 
@@ -1200,3 +1217,101 @@ def compute_earliest_route(
         path.append(v)
         u = v
     return t, path
+
+
+# ---------- 单路口排队预测（queue forecast） ----------
+
+
+def is_green(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    time: int,
+) -> bool:
+    """绝对时刻 time 在该路口是否为绿灯。
+
+    相位约定与 :func:`next_green_departure` 一致：本地相位
+    ``(time + offset) mod cycle`` 落在绿灯半开区间内为绿；
+    ``green_start == green_end`` 为整周期常绿；跨零点绿灯由取模自然处理。
+    """
+    if green_start == green_end:
+        return True
+    phase = (time + offset) % cycle
+    if green_start < green_end:
+        return green_start <= phase < green_end
+    return phase >= green_start or phase < green_end
+
+
+def compute_queue_forecast(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    forecast_from: int,
+    forecast_to: int,
+    discharge_per_second: int,
+    initial_queue: int,
+    arrivals: Iterable[tuple[int, int]],
+) -> tuple[list[int | None], int, int]:
+    """单路口逐秒排队模拟：各批最后通过秒、期末待行车辆数与最大排队数。
+
+    信号参数（cycle / offset / green_start / green_end）的相位、半开绿灯、
+    跨零点与整周期常绿语义与 :func:`compute_windows` 完全一致。预测范围为
+    半开区间 ``[forecast_from, forecast_to)``；``discharge_per_second`` 为
+    每个绿灯秒最多放行的车辆数（正整数）；``initial_queue`` 为范围起点时
+    已在排队的车辆数（非负整数，不属于任何到达批次）；``arrivals`` 为到达
+    批次 ``(time, vehicles)`` 序列（vehicles 为正整数，time 已请求侧保证
+    落在预测范围内），同秒多批按输入顺序入队。
+
+    每个整数秒的处理顺序：**先**把当秒到达的批次按输入顺序整体入队（此时
+    的队列长度——到达后、放行前——参与最大排队数统计），**再**判定当秒
+    灯色，绿灯时按先到先走放行至多 ``discharge_per_second`` 辆，红灯不
+    放行。期初队列排在最前，但不属于任何批次、不产生通过秒。
+
+    队列用**批次计数**推进：队首元素为 ``[批次下标, 剩余辆数]``（期初队列
+    用下标 -1 表示），放行时整批或部分地扣减队首计数，不逐辆展开；某批
+    剩余计数归零的秒即该批最后一辆的通过秒，范围内未全部通过的批次记
+    ``None``。返回 ``(各批最后通过秒列表, 期末待行车辆数, 最大排队数)``，
+    列表与 ``arrivals`` 一一对应。
+
+    复杂度 ``O(范围秒数 + 批次数)``：每批入队、出队各一次，部分放行每秒
+    至多触及一个队首批次。
+    """
+    batches = list(arrivals)
+    # 当秒到达的批次下标（保持输入顺序）；范围外到达已由请求侧 422 拦截。
+    by_second: dict[int, list[int]] = {}
+    for index, (moment, _count) in enumerate(batches):
+        by_second.setdefault(moment, []).append(index)
+
+    pass_times: list[int | None] = [None] * len(batches)
+    queue: deque[list[int]] = deque()  # 队首元素：[批次下标（期初为 -1）, 剩余辆数]
+    waiting = 0
+    if initial_queue:
+        queue.append([-1, initial_queue])
+        waiting = initial_queue
+    max_queue = 0
+    for now in range(forecast_from, forecast_to):
+        # 1) 当秒到达批次按输入顺序入队；2) 到达后、放行前统计最大排队数。
+        for index in by_second.get(now, ()):
+            queue.append([index, batches[index][1]])
+            waiting += batches[index][1]
+        if waiting > max_queue:
+            max_queue = waiting
+        # 3) 判灯放行：绿灯秒按先到先走放行至多 discharge_per_second 辆。
+        if waiting and is_green(cycle, offset, green_start, green_end, now):
+            remaining = discharge_per_second
+            while remaining and queue:
+                head = queue[0]
+                if head[1] <= remaining:
+                    remaining -= head[1]
+                    waiting -= head[1]
+                    if head[0] >= 0:
+                        # 该批最后一辆在当秒通过
+                        pass_times[head[0]] = now
+                    queue.popleft()
+                else:
+                    head[1] -= remaining
+                    waiting -= remaining
+                    remaining = 0
+    return pass_times, waiting, max_queue

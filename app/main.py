@@ -9,6 +9,7 @@ from .greenwave import (
     compute_earliest_route,
     compute_max_coverage,
     compute_plan_switch_windows,
+    compute_queue_forecast,
     compute_slot_offsets,
     compute_timetable_reschedule,
     compute_windows,
@@ -24,6 +25,8 @@ from .schemas import (
     OffsetDiagnosticsResponse,
     OffsetInterval,
     PlanSwitchRequest,
+    QueueForecastRequest,
+    QueueForecastResponse,
     SlotOffsetsRequest,
     SlotOffsetsResponse,
     TimetableRescheduleRequest,
@@ -81,9 +84,16 @@ app = FastAPI(
         "时驶入下一条路；到终点即完成，不检查终点灯色。返回最早到达秒数"
         "与路口下标路径；同到达时间先取道路数少者，再取路径字典序小者，"
         "不可达返回 null。求解分 (到达时刻,道路数) Pareto Dijkstra、倒推"
-        "最晚可行到达与字典序贪心重建三个阶段，不枚举路径。"
+        "最晚可行到达与字典序贪心重建三个阶段，不枚举路径。\n\n"
+        "排队预测接口 `POST /api/green-wave/queue-forecast`：给定单路口的"
+        "周期、offset 与绿灯半开区间（跨零点与常绿语义同上）、最长 86400 "
+        "秒的半开预测范围、每绿灯秒放行量、期初队列与至多 1000 条到达批次"
+        "（时刻、正整数车辆数，同秒可多批）。每秒先按输入顺序将到达批次"
+        "入队，再判灯并按先到先走放行，红灯不放行；用批次计数推进队列，"
+        "不逐辆展开。返回各批最后一辆的通过秒（范围内未全部通过为 null）、"
+        "期末待行车辆数与最大排队数（每秒到达后、放行前统计）。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -315,3 +325,31 @@ def green_wave_earliest_route(
         return None
     arrival, path = result
     return EarliestRouteResponse(arrival=arrival, path=path)
+
+
+@app.post(
+    "/api/green-wave/queue-forecast",
+    response_model=QueueForecastResponse,
+    tags=["绿波"],
+    summary="单路口排队预测：各批最后通过秒、期末待行与最大排队",
+)
+def green_wave_queue_forecast(
+    request: QueueForecastRequest,
+) -> QueueForecastResponse:
+    request.validate_ranges()
+    pass_times, final_queue, max_queue = compute_queue_forecast(
+        cycle=request.cycle,
+        offset=request.offset,
+        green_start=request.green_start,
+        green_end=request.green_end,
+        forecast_from=request.forecast_from,
+        forecast_to=request.forecast_to,
+        discharge_per_second=request.discharge_per_second,
+        initial_queue=request.initial_queue,
+        arrivals=((item.time, item.vehicles) for item in request.arrivals),
+    )
+    return QueueForecastResponse(
+        batch_pass_times=pass_times,
+        final_queue=final_queue,
+        max_queue=max_queue,
+    )

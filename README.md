@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供八个接口：
+提供九个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -59,6 +59,16 @@
    到达时刻相同时先取**道路数更少**者，再取**路径字典序更小**者；不可达时响应体为
    `null`。求解分 （到达时刻， 道路数） **Pareto Dijkstra**、**倒推最晚可行到达**与
    **字典序贪心重建**三个阶段，不枚举路径。
+9. **单路口排队预测** `POST /api/green-wave/queue-forecast`：给定**单个路口**的
+   `cycle`、`offset`、`green_start`、`green_end`（相位、绿灯半开区间、跨周期零点与
+   整周期常绿语义与其余接口完全一致）、最长 **86400 秒**的整数秒**半开**预测范围
+   `[forecast_from, forecast_to)`、每绿灯秒放行量 `discharge_per_second`、期初队列
+   `initial_queue` 与至多 **1000 条**到达批次 `arrivals`（`{time, vehicles}`，
+   车辆数为正整数，同一秒可多批）。每个整数秒**先**把当秒到达的批次**按输入顺序**
+   入队，**再**判灯并按**先到先走**放行（绿灯秒至多放行 `discharge_per_second` 辆，
+   红灯不放行）；队列用**批次计数**推进，不逐辆展开。返回**各批最后一辆的通过秒**
+   （范围内未全部通过为 `null`）、**期末待行车辆数**与**最大排队数**（每秒到达后、
+   放行前统计）。
 
 ## 目录结构
 
@@ -125,6 +135,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 计划切换发车窗口 | `POST http://localhost:8000/api/green-wave/plan-switch-windows` |
 | 班次重排 | `POST http://localhost:8000/api/green-wave/timetable-reschedule` |
 | 最早到达路径 | `POST http://localhost:8000/api/green-wave/earliest-route` |
+| 单路口排队预测 | `POST http://localhost:8000/api/green-wave/queue-forecast` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -1144,6 +1155,123 @@ curl -s -X POST http://localhost:8000/api/green-wave/earliest-route \
 阶段全部道路各扫描一次、阶段数不超过路口数），30 路口、120 条道路的最坏规模也
 在毫秒级完成；测试含 3000 组随机参数下与枚举全部简单路径的暴力参考实现的逐项对照。
 
+## 单路口排队预测
+
+`POST /api/green-wave/queue-forecast` 在**单个路口**上按秒模拟排队与放行：给定信号
+周期、相位偏移与绿灯半开区间（`(t+offset) mod cycle`、跨周期零点、`green_start ==
+green_end` 为整周期常绿的语义与其余接口**完全一致**），预测范围
+`[forecast_from, forecast_to)` 内每个整数秒**先**把当秒到达的批次**按输入顺序**
+整体入队，**再**判定当秒灯色，绿灯时按**先到先走**放行至多 `discharge_per_second`
+辆车，红灯不放行。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `forecast_from` | int | `>= 0`，预测范围起点（秒，含） |
+| `forecast_to` | int | `> forecast_from`，且 `forecast_to - forecast_from <= 86400` |
+| `cycle` | int | `1..86400`，信号周期 C（秒） |
+| `offset` | int | `0 <= offset < cycle`，相位偏移 |
+| `green_start` | int | `0 <= green_start < cycle`，绿灯起点（本地相位秒） |
+| `green_end` | int | `0 <= green_end < cycle`，绿灯终点（不含）；与 `green_start` 相等表示整周期常绿 |
+| `discharge_per_second` | int | `>= 1`，每个绿灯秒最多放行的车辆数 |
+| `initial_queue` | int | `>= 0`，预测范围起点时已在排队等待的车辆数（不属于任何批次） |
+| `arrivals` | array | **0..1000** 条到达批次 |
+| `arrivals[].time` | int | 到达时刻（整数秒），**必须落在** `[forecast_from, forecast_to)` 内，否则 422 |
+| `arrivals[].vehicles` | int | `>= 1`，该批到达的车辆数（正整数） |
+
+语义要点：
+
+- 同一秒可有多个到达批次，**按输入顺序**入队；期初队列排在最前，但不属于任何批次、
+  不产生通过秒。
+- 每秒的放行发生在**当秒到达入队之后**：当秒到达的批次若遇绿灯，当秒即可开始通过；
+  某批最后一辆车被放行的秒即该批的**通过秒**。
+- **最大排队数**在每秒**到达后、放行前**统计（含第一秒的期初队列）；即使放行能力
+  足以当秒清空，到达瞬间的峰值仍会被计入。
+- 批次车辆在预测范围内**未全部通过**时，该批通过秒为 `null`（部分通过也算未全部
+  通过）。
+
+成功响应：
+
+```json
+{
+  "batch_pass_times": [6, 7, 62],
+  "final_queue": 0,
+  "max_queue": 6
+}
+```
+
+- `batch_pass_times`：各批最后一辆车的通过秒，与 `arrivals` 一一对应；未全部通过
+  为 `null`；
+- `final_queue`：预测范围终点时仍在排队等待的车辆数（期末待行车辆数）；
+- `max_queue`：预测范围内的最大排队车辆数（每秒到达后、放行前统计）。
+
+### 示例 1：红灯积压、绿灯清空
+
+周期 60 秒、绿灯 `[0,30)`、每秒放行 2 辆，期初 3 辆；`t=5` 同秒到达两批（4 辆与
+2 辆，按输入顺序入队），`t=40`（红灯时段）再到达 6 辆：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/queue-forecast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "forecast_from": 0,
+    "forecast_to": 120,
+    "cycle": 60,
+    "offset": 0,
+    "green_start": 0,
+    "green_end": 30,
+    "discharge_per_second": 2,
+    "initial_queue": 3,
+    "arrivals": [
+      {"time": 5,  "vehicles": 4},
+      {"time": 5,  "vehicles": 2},
+      {"time": 40, "vehicles": 6}
+    ]
+  }'
+```
+
+响应（期初 3 辆在 `t=0..1` 先走；第一批 4 辆在 `t=6` 走完、第二批 2 辆在 `t=7`
+走完；`t=40` 到达的 6 辆遇红灯积压，等下一周期绿灯在 `t=62` 走完；最大排队 6 辆
+出现在 `t=5` 到达后）：
+
+```json
+{"batch_pass_times":[6,7,62],"final_queue":0,"max_queue":6}
+```
+
+### 示例 2：范围内未全部通过为 null
+
+常绿路口每秒放行 1 辆，`t=8` 到达 5 辆，范围 `[0,10)` 内只能走 2 辆：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/queue-forecast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "forecast_from": 0,
+    "forecast_to": 10,
+    "cycle": 60,
+    "offset": 0,
+    "green_start": 0,
+    "green_end": 0,
+    "discharge_per_second": 1,
+    "initial_queue": 0,
+    "arrivals": [{"time": 8, "vehicles": 5}]
+  }'
+# {"batch_pass_times":[null],"final_queue":3,"max_queue":5}
+```
+
+### 排队预测的算法说明（批次计数推进，不逐辆展开）
+
+1. **按秒模拟**：预测范围最长 86400 秒，逐秒处理——先把当秒到达的批次按输入顺序
+   整体入队并统计最大排队数，再按 `(t+offset) mod cycle` 判定灯色，绿灯秒放行
+   至多 `discharge_per_second` 辆；
+2. **批次计数队列**：队首元素为"批次下标 + 剩余辆数"（期初队列用伪批次表示），
+   放行时整批或部分地扣减队首计数，**不逐辆展开**——单批 10^12 辆也只需常数次
+   计数扣减；某批剩余计数归零的秒即该批最后一辆的通过秒；
+3. 复杂度 `O(范围秒数 + 批次数)`：每批入队、出队各一次，部分放行每秒至多触及
+   一个队首批次；全天范围、1000 批次的请求在毫秒级完成。测试含 2000 组随机参数
+   下与**逐辆展开**暴力参考实现的逐项对照。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -1233,6 +1361,20 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 { "detail": ["roads[0].to 必须满足 0 <= to < 路口数（当前 3 个）"] }
 ```
 
+`/api/green-wave/queue-forecast` 的 422 校验：
+
+- `cycle ∈ [1, 86400]`、`discharge_per_second >= 1`、`initial_queue >= 0`、
+  `arrivals[].vehicles >= 1`（正整数车辆数）、`arrivals` 数量不超过 **1000**
+  （字段级 422）；
+- `0 <= offset / green_start / green_end < cycle`（跨字段 422）；
+- `forecast_to > forecast_from` 且预测范围长度不超过 **86400 秒**（跨字段 422）；
+- 每条到达批次的 `time` 必须落在半开预测范围 `[forecast_from, forecast_to)` 内
+  （**范围外到达**为跨字段 422，错误信息带批次下标与时刻）。
+
+```json
+{ "detail": ["arrivals[0].time = 60 必须落在预测范围 [0, 60) 内"] }
+```
+
 ## 算法说明（区间运算，不逐秒试探）
 
 1. **周期内展开与波动收缩**：每个路口的绿灯半开区间先展开为连续分量
@@ -1272,6 +1414,11 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 `O(班次数 × 每班候选数)`（上限 50 × 3600 次 O(1) 转移），不逐班贪心、不枚举时刻表
 组合。
 
+`/api/green-wave/queue-forecast` 为单路口逐秒模拟：每秒先把当秒到达批次按输入顺序
+入队（到达后、放行前统计最大排队数），再按 `(t+offset) mod cycle` 判灯，绿灯秒按
+先到先走放行至多 `discharge_per_second` 辆；队列用批次计数（队首为"批次下标 +
+剩余辆数"）推进，不逐辆展开，复杂度 `O(范围秒数 + 批次数)`。
+
 ## 运行测试
 
 ```bash
@@ -1301,4 +1448,8 @@ pytest -q
 `(总成本, 时刻表元组)`）的逐项对照，并覆盖逐班贪心选最近点导致误判无解的
 陷阱用例、同成本字典序 tie-break（单班与多班联动）、容限 0、headway 顶破
 原时刻、半开绿灯 / 范围右端边界、跨零点绿灯、行驶时间波动收缩候选、50 班
-上界性能、无解返回 `null` 及 422 校验等场景。
+上界性能、无解返回 `null` 及 422 校验等场景；单路口排队预测
+另有 2000 组随机参数下与逐辆展开暴力参考实现的逐项对照，并覆盖红灯不放行、
+同秒多批按输入顺序入队、期初队列、跨零点绿灯、常绿、offset 相位、半开绿灯
+端点、批内部分通过（返回 `null`）、最大排队数在到达后放行前统计、全天范围
+1000 批次、超大车辆数（不逐辆展开）及范围外到达、无效信号参数等 422 校验场景。

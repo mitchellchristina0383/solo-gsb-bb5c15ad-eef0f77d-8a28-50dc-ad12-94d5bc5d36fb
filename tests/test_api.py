@@ -7,6 +7,7 @@ from app.main import (
     green_wave_earliest_route,
     green_wave_max_coverage,
     green_wave_offset_diagnostics,
+    green_wave_queue_forecast,
     green_wave_slot_offsets,
     green_wave_timetable_reschedule,
     green_wave_windows,
@@ -17,6 +18,7 @@ from app.schemas import (
     GreenWaveRequest,
     Intersection,
     OffsetDiagnosticsRequest,
+    QueueForecastRequest,
     SlotOffsetsRequest,
     TimetableRescheduleRequest,
 )
@@ -1071,3 +1073,152 @@ def test_earliest_route_route_is_in_openapi():
     ref = response["content"]["application/json"]["schema"]
     assert {"type": "null"} in ref["anyOf"]
     assert any("$ref" in item for item in ref["anyOf"])
+
+
+# ---------- POST /api/green-wave/queue-forecast ----------
+
+def make_queue_request(payload):
+    return QueueForecastRequest.model_validate(payload)
+
+
+def queue_payload(**kw):
+    base = {
+        "forecast_from": 0,
+        "forecast_to": 60,
+        "cycle": 60,
+        "offset": 0,
+        "green_start": 0,
+        "green_end": 0,  # 常绿
+        "discharge_per_second": 1,
+        "initial_queue": 0,
+        "arrivals": [],
+    }
+    base.update(kw)
+    return base
+
+
+def test_queue_forecast_payload():
+    # 常绿每秒放行 1：期初 2 辆先走，t=1 到达的 3 辆批次在 t=4 走完
+    req = make_queue_request(
+        queue_payload(initial_queue=2, arrivals=[{"time": 1, "vehicles": 3}])
+    )
+    resp = green_wave_queue_forecast(req)
+    assert resp.batch_pass_times == [4]
+    assert resp.final_queue == 0
+    assert resp.max_queue == 4
+
+
+def test_queue_forecast_red_light_and_null_pass_time():
+    # 绿灯 [0,10)：t=20 到达的批次在范围内一直遇红，全部待行
+    req = make_queue_request(
+        queue_payload(
+            green_start=0,
+            green_end=10,
+            discharge_per_second=5,
+            arrivals=[{"time": 20, "vehicles": 3}],
+        )
+    )
+    resp = green_wave_queue_forecast(req)
+    assert resp.batch_pass_times == [None]
+    assert resp.final_queue == 3
+    assert resp.max_queue == 3
+
+
+def test_queue_forecast_same_second_batches_input_order():
+    req = make_queue_request(
+        queue_payload(
+            forecast_to=10,
+            arrivals=[
+                {"time": 0, "vehicles": 2},
+                {"time": 0, "vehicles": 1},
+            ],
+        )
+    )
+    resp = green_wave_queue_forecast(req)
+    assert resp.batch_pass_times == [1, 2]
+    assert resp.final_queue == 0
+    assert resp.max_queue == 3
+
+
+def test_queue_forecast_rejects_arrival_outside_range():
+    req = make_queue_request(
+        queue_payload(arrivals=[{"time": 60, "vehicles": 1}])
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_queue_forecast(req)
+    assert exc.value.status_code == 422
+    req = make_queue_request(
+        queue_payload(arrivals=[{"time": -1, "vehicles": 1}])
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_queue_forecast(req)
+    assert exc.value.status_code == 422
+
+
+def test_queue_forecast_rejects_invalid_signal_params():
+    # offset / green_start / green_end 必须落在 [0, cycle) 内
+    for field, value in (("offset", 60), ("green_start", 60), ("green_end", 60)):
+        req = make_queue_request(queue_payload(**{field: value}))
+        with pytest.raises(HTTPException) as exc:
+            green_wave_queue_forecast(req)
+        assert exc.value.status_code == 422
+    with pytest.raises(ValidationError):
+        make_queue_request(queue_payload(cycle=0))
+
+
+def test_queue_forecast_rejects_bad_range():
+    # 空范围与超长范围均 422
+    req = make_queue_request(queue_payload(forecast_from=10, forecast_to=10))
+    with pytest.raises(HTTPException) as exc:
+        green_wave_queue_forecast(req)
+    assert exc.value.status_code == 422
+    req = make_queue_request(queue_payload(forecast_to=86401))
+    with pytest.raises(HTTPException) as exc:
+        green_wave_queue_forecast(req)
+    assert exc.value.status_code == 422
+
+
+def test_queue_forecast_rejects_bad_batch_fields():
+    # 车辆数必须为正整数
+    with pytest.raises(ValidationError):
+        make_queue_request(
+            queue_payload(arrivals=[{"time": 0, "vehicles": 0}])
+        )
+    # 批次数超过 1000
+    with pytest.raises(ValidationError):
+        make_queue_request(
+            queue_payload(
+                forecast_to=2000,
+                arrivals=[
+                    {"time": i, "vehicles": 1} for i in range(1001)
+                ],
+            )
+        )
+    # 放行量与期初队列的字段级约束
+    with pytest.raises(ValidationError):
+        make_queue_request(queue_payload(discharge_per_second=0))
+    with pytest.raises(ValidationError):
+        make_queue_request(queue_payload(initial_queue=-1))
+
+
+def test_queue_forecast_accepts_1000_batches_boundary():
+    req = make_queue_request(
+        queue_payload(
+            forecast_to=86400,
+            arrivals=[
+                {"time": 80 * i, "vehicles": 3} for i in range(1000)
+            ],
+        )
+    )
+    resp = green_wave_queue_forecast(req)
+    assert resp.batch_pass_times == [80 * i + 2 for i in range(1000)]
+    assert resp.final_queue == 0
+    assert resp.max_queue == 3
+
+
+def test_queue_forecast_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/queue-forecast" in paths
+    assert "post" in paths["/api/green-wave/queue-forecast"]

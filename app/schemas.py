@@ -6,10 +6,12 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from .greenwave import (
+    MAX_ARRIVAL_BATCHES,
     MAX_CONVOY_VEHICLES,
     MAX_CYCLE,
     MAX_INTERSECTIONS,
     MAX_OBSERVATIONS,
+    MAX_QUEUE_FORECAST_SECONDS,
     MAX_RESCHEDULE_TRIPS,
     MAX_ROADS,
     MAX_ROUTE_INTERSECTIONS,
@@ -547,4 +549,95 @@ class EarliestRouteResponse(BaseModel):
             "取得最早到达的路口下标路径（含起点与终点）；同到达时刻先取道路数"
             "更少者，再取路径字典序更小者"
         ),
+    )
+
+
+# ---------- 单路口排队预测 ----------
+
+
+class ArrivalBatch(BaseModel):
+    """一条到达批次：整数秒到达时刻与正整数车辆数。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    time: int = Field(
+        ..., description="到达时刻（整数秒），须落在预测范围 [forecast_from, forecast_to) 内"
+    )
+    vehicles: int = Field(
+        ..., ge=1, description="该批到达的车辆数（正整数）"
+    )
+
+
+class QueueForecastRequest(BaseModel):
+    """单路口排队预测请求。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    forecast_from: int = Field(
+        ..., ge=0, description="预测范围起点（秒，含）"
+    )
+    forecast_to: int = Field(
+        ..., ge=1, description="预测范围终点（秒，不含）；范围长度 1..86400"
+    )
+    cycle: int = Field(
+        ..., ge=1, le=MAX_CYCLE, description="信号周期 C（秒），1..86400"
+    )
+    offset: int = Field(..., ge=0, description="相位偏移 o（秒），需满足 0 <= o < C")
+    green_start: int = Field(
+        ..., ge=0, description="绿灯起点（本地相位秒），需满足 0 <= g_start < C"
+    )
+    green_end: int = Field(
+        ..., ge=0, description="绿灯终点（本地相位秒，不含），需满足 0 <= g_end < C"
+    )
+    discharge_per_second: int = Field(
+        ..., ge=1, description="每个绿灯秒最多放行的车辆数（正整数）"
+    )
+    initial_queue: int = Field(
+        ..., ge=0, description="预测范围起点时已在排队等待的车辆数（非负整数）"
+    )
+    arrivals: list[ArrivalBatch] = Field(
+        ..., max_length=MAX_ARRIVAL_BATCHES,
+        description="到达批次列表，0..1000 条；同一秒可多批，按输入顺序入队",
+    )
+
+    def validate_ranges(self) -> None:
+        """跨字段校验：范围长度、相位上界与到达时刻；不合法时抛出 HTTP 422。"""
+        errors: list[str] = []
+        length = self.forecast_to - self.forecast_from
+        if length <= 0:
+            errors.append("forecast_to 必须大于 forecast_from（半开预测范围）")
+        elif length > MAX_QUEUE_FORECAST_SECONDS:
+            errors.append("预测范围长度不得超过 86400 秒")
+        if not 0 <= self.offset < self.cycle:
+            errors.append("offset 必须满足 0 <= offset < cycle")
+        if not 0 <= self.green_start < self.cycle:
+            errors.append("green_start 必须满足 0 <= green_start < cycle")
+        if not 0 <= self.green_end < self.cycle:
+            errors.append("green_end 必须满足 0 <= green_end < cycle")
+        for index, batch in enumerate(self.arrivals):
+            if not self.forecast_from <= batch.time < self.forecast_to:
+                errors.append(
+                    f"arrivals[{index}].time = {batch.time} 必须落在预测范围 "
+                    f"[{self.forecast_from}, {self.forecast_to}) 内"
+                )
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class QueueForecastResponse(BaseModel):
+    """单路口排队预测结果：各批最后通过秒、期末待行车辆数与最大排队数。"""
+
+    batch_pass_times: list[int | None] = Field(
+        ...,
+        description=(
+            "各到达批次最后一辆车的通过秒（整数秒，与 arrivals 一一对应）；"
+            "该批车辆在预测范围内未全部通过时为 null"
+        ),
+    )
+    final_queue: int = Field(
+        ..., ge=0, description="预测范围终点时仍在排队等待的车辆数（期末待行车辆数）"
+    )
+    max_queue: int = Field(
+        ..., ge=0,
+        description="预测范围内的最大排队车辆数（每秒到达批次入队后、放行前统计）",
     )
