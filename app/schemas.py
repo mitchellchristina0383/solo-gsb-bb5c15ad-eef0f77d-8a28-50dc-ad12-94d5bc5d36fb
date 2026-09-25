@@ -6,10 +6,12 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from .greenwave import (
+    MAX_ARRIVAL_BATCHES,
     MAX_CONVOY_VEHICLES,
     MAX_CYCLE,
     MAX_INTERSECTIONS,
     MAX_OBSERVATIONS,
+    MAX_QUEUE_FORECAST_SECONDS,
     MAX_RESCHEDULE_TRIPS,
     MAX_ROADS,
     MAX_ROUTE_INTERSECTIONS,
@@ -546,5 +548,115 @@ class EarliestRouteResponse(BaseModel):
         description=(
             "取得最早到达的路口下标路径（含起点与终点）；同到达时刻先取道路数"
             "更少者，再取路径字典序更小者"
+        ),
+    )
+
+
+# ---------- 单路口排队预测 ----------
+
+
+class ArrivalBatchInput(BaseModel):
+    """一个到达批次：整数秒到达时刻与该批正整数辆车。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    arrival_time: int = Field(
+        ...,
+        description=(
+            "批次到达时刻 t（整数秒），必须落在半开预测范围 "
+            "[forecast_from, forecast_to) 内，否则 422"
+        ),
+    )
+    count: int = Field(
+        ..., ge=1, description="该批车辆数（正整数）；同一秒可给多个批次"
+    )
+
+
+class QueueForecastRequest(BaseModel):
+    """单路口排队预测请求。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cycle: int = Field(
+        ..., ge=1, le=MAX_CYCLE, description="信号周期 C（秒），1..86400"
+    )
+    offset: int = Field(..., ge=0, description="相位偏移 o（秒），需满足 0 <= o < C")
+    green_start: int = Field(
+        ..., ge=0, description="绿灯起点（本地相位秒），需满足 0 <= green_start < C"
+    )
+    green_end: int = Field(
+        ..., ge=0, description="绿灯终点（本地相位秒，不含），需满足 0 <= green_end < C；与 green_start 相等表示整周期常绿"
+    )
+    forecast_from: int = Field(
+        ..., ge=0, le=MAX_CYCLE, description="半开预测范围起点（秒，含），非负整数"
+    )
+    forecast_to: int = Field(
+        ..., ge=1, le=2 * MAX_CYCLE,
+        description="半开预测范围终点（秒，不含）；须大于起点且范围长度 1..86400",
+    )
+    discharge_per_second: int = Field(
+        ..., ge=1, description="每个绿灯秒的放行车数（正整数）；红灯秒不放行"
+    )
+    initial_queue: int = Field(
+        default=0,
+        ge=0,
+        description="期初（forecast_from 秒开始时）已在排队的车辆数（非负整数），缺省为 0",
+    )
+    arrivals: list[ArrivalBatchInput] = Field(
+        default_factory=list,
+        max_length=MAX_ARRIVAL_BATCHES,
+        description=(
+            "到达批次列表，0..1000 条，每条为 {arrival_time, count}（count 为"
+            "正整数）；同一到达秒可给多条批次，模拟时按本列表顺序先到先走"
+        ),
+    )
+
+    def validate_ranges(self) -> None:
+        """跨字段校验：信号相位上界、预测范围长度与到达时刻；非法时抛 HTTP 422。"""
+        errors: list[str] = []
+        if not 0 <= self.offset < self.cycle:
+            errors.append("offset 必须满足 0 <= offset < cycle")
+        if not 0 <= self.green_start < self.cycle:
+            errors.append("green_start 必须满足 0 <= green_start < cycle")
+        if not 0 <= self.green_end < self.cycle:
+            errors.append("green_end 必须满足 0 <= green_end < cycle")
+        length = self.forecast_to - self.forecast_from
+        if length <= 0:
+            errors.append("forecast_to 必须大于 forecast_from（半开预测范围）")
+        elif length > MAX_QUEUE_FORECAST_SECONDS:
+            errors.append("预测范围长度不得超过 86400 秒（一日）")
+        # 仅在范围本身合法时检查到达时刻，避免叠加无意义的报错。
+        if length > 0:
+            for index, batch in enumerate(self.arrivals):
+                if not self.forecast_from <= batch.arrival_time < self.forecast_to:
+                    errors.append(
+                        f"arrivals[{index}].arrival_time = {batch.arrival_time} "
+                        f"必须落在预测范围 [{self.forecast_from}, {self.forecast_to}) 内"
+                    )
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class QueueForecastResponse(BaseModel):
+    """单路口排队预测结果：逐批通过秒、期末待行车辆数与最大排队数。"""
+
+    pass_times: list[int | None] = Field(
+        ...,
+        description=(
+            "与请求 arrivals 一一对应的各批最后一辆通过秒（整数秒）；该批在"
+            "预测范围结束前未全部放行（含恰在 forecast_to 秒才放完）时为 null"
+        ),
+    )
+    remaining_queue: int = Field(
+        ...,
+        ge=0,
+        description="期末（forecast_to 秒开始前、即最后一秒放行结束后）待行车辆数",
+    )
+    max_queue: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "预测范围内的最大排队车辆数；在每秒到达批次入队后、放行前统计，"
+            "期初非空队列计入（无任何到达时为 initial_queue）"
         ),
     )

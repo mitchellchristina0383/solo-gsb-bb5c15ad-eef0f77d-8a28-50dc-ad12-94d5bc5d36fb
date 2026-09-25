@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供八个接口：
+提供九个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -59,6 +59,15 @@
    到达时刻相同时先取**道路数更少**者，再取**路径字典序更小**者；不可达时响应体为
    `null`。求解分 （到达时刻， 道路数） **Pareto Dijkstra**、**倒推最晚可行到达**与
    **字典序贪心重建**三个阶段，不枚举路径。
+9. **单路口排队预测** `POST /api/green-wave/queue-forecast`：沿用现有周期、`offset` 与
+   绿灯半开区间（跨零点、整周期常绿）语义，在长度不超过 **86400 秒**的**半开**预测范围
+   `[forecast_from, forecast_to)` 内逐秒模拟单个路口的排队消散。给定每个绿灯秒的放行车数
+   `discharge_per_second`（红灯秒不放行）、期初队列 `initial_queue` 与至多 **1000 条**
+   到达批次（`arrival_time` 到达秒、`count` 正整数车辆数，**同一秒可给多批**、按输入顺序
+   先到先走）。每秒**先**按输入顺序把到达批次入队，**再**判灯并按 FIFO 放行（放行可跨
+   批次部分截断）；**最大排队数在当秒到达后、放行前统计**。队列以**批次计数**推进，
+   **不逐辆展开**。返回各批**最后一辆的通过秒**（范围内未全部通过为 `null`）、**期末
+   待行车辆数**与**最大排队数**；范围外到达及无效信号参数返回 422。
 
 ## 目录结构
 
@@ -125,6 +134,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 计划切换发车窗口 | `POST http://localhost:8000/api/green-wave/plan-switch-windows` |
 | 班次重排 | `POST http://localhost:8000/api/green-wave/timetable-reschedule` |
 | 最早到达路径 | `POST http://localhost:8000/api/green-wave/earliest-route` |
+| 单路口排队预测 | `POST http://localhost:8000/api/green-wave/queue-forecast` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -1144,6 +1154,161 @@ curl -s -X POST http://localhost:8000/api/green-wave/earliest-route \
 阶段全部道路各扫描一次、阶段数不超过路口数），30 路口、120 条道路的最坏规模也
 在毫秒级完成；测试含 3000 组随机参数下与枚举全部简单路径的暴力参考实现的逐项对照。
 
+## 单路口排队预测
+
+`POST /api/green-wave/queue-forecast` 在给定信号计划下预测单个路口在一段时间内的排队
+消散过程，信号语义与其余接口**完全一致**：本地相位 `(t + offset) mod cycle`、绿灯为
+半开区间（`green_start < green_end` 一段、`green_start > green_end` 跨零点两段、
+`green_start == green_end` 整周期常绿，绿灯起点含、终点不含）。
+
+预测范围为半开整数秒区间 `[forecast_from, forecast_to)`，长度 **1..86400 秒**（一日）。
+每个模拟秒严格按以下顺序推进：
+
+1. **到达入队**：先按请求中 `arrivals` 的**输入顺序**把该秒的全部到达批次追加到队尾
+   （同一秒可给多个批次，同秒批次保留先后次序；不同秒之间按时间先后，天然 FIFO）；
+2. **统计最大排队**：在当秒到达**之后、放行之前**统计队列总车数，更新 `max_queue`
+   （期初队列在首秒放行前即计入，故 `initial_queue > 0` 时 `max_queue` 至少为它）；
+3. **判灯放行**：该秒为绿灯时按队列**先到先走**（FIFO）放行至多
+   `discharge_per_second` 辆（正整数，每个绿灯秒相同）；**红灯秒一辆不放行**。放行可在
+   批次中间截断（一批 10 辆、每秒放 3 辆时，前 3 辆与接下来 3 辆分别在两个绿灯秒通过，
+   该批结果只记录**最后一辆**的通过秒）。
+
+期初队列 `initial_queue`（非负整数，缺省 0）先于任何到达批次接受放行，但它不对应请求
+中的任何批次，故不出现在逐批结果里；`arrivals` 可为空数组（或缺省），至多 **1000 条**。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `cycle` | int | `1..86400`，信号周期 C（秒） |
+| `offset` | int | `0 <= offset < cycle`，相位偏移 |
+| `green_start` | int | `0 <= green_start < cycle`，绿灯起点（本地相位秒） |
+| `green_end` | int | `0 <= green_end < cycle`，绿灯终点（本地相位秒，不含）；与 `green_start` 相等表示整周期常绿 |
+| `forecast_from` | int | `>= 0`，半开预测范围起点（秒，含） |
+| `forecast_to` | int | `> forecast_from`，且 `forecast_to - forecast_from <= 86400`（半开终点，不含） |
+| `discharge_per_second` | int | `>= 1`，每个绿灯秒放行的车辆数；红灯秒不放行 |
+| `initial_queue` | int | `>= 0`，缺省 `0`：期初已在排队的车辆数 |
+| `arrivals` | array | **0..1000** 条到达批次，可缺省为空 |
+| `arrivals[].arrival_time` | int | 到达秒，必须满足 `forecast_from <= arrival_time < forecast_to`，否则 422 |
+| `arrivals[].count` | int | `>= 1`，该批车辆数（正整数）；同一秒可给多条批次 |
+
+响应：
+
+- `pass_times`：与请求 `arrivals` **一一对应**、等长的数组，元素为各批**最后一辆**
+  通过停止线的整数秒；该批在预测范围结束前未全部放行（包括恰好在 `forecast_to` 秒才
+  放完的情形——该秒不在半开范围内）时为 `null`；
+- `remaining_queue`：**期末待行车辆数**，即最后一个模拟秒（`forecast_to - 1`）放行
+  结束后队列中的车辆总数（含只放行了一部分的批次）；
+- `max_queue`：范围内**最大排队车辆数**，在每秒"到达后、放行前"统计。
+
+```json
+{
+  "pass_times": [2, null],
+  "remaining_queue": 1,
+  "max_queue": 3
+}
+```
+
+### 示例 1：红灯积压、跨批次部分放行
+
+周期 10 秒、绿灯为本地相位 `[0,5)`、每个绿灯秒放 2 辆，预测范围 `[0,10)`，期初已有
+3 辆车排队，另在第 2 秒到达一批 2 辆、第 8 秒到达一批 1 辆：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/queue-forecast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cycle": 10,
+    "offset": 0,
+    "green_start": 0,
+    "green_end": 5,
+    "forecast_from": 0,
+    "forecast_to": 10,
+    "discharge_per_second": 2,
+    "initial_queue": 3,
+    "arrivals": [
+      {"arrival_time": 2, "count": 2},
+      {"arrival_time": 8, "count": 1}
+    ]
+  }'
+```
+
+期初 3 辆在第 0、1 秒放完（t0 放 2、t1 放 1）；第 2 秒队列已空，新到的 2 辆当秒全部
+放行，故第 0 批最后一辆通过秒为 **2**；第 8 秒本地相位为 8（红灯），第 9 秒仍红，
+第 1 批一辆未放，通过秒为 `null`、期末剩 1 辆。最大排队出现在首秒放行前期初的 3 辆：
+
+```json
+{"pass_times":[2,null],"remaining_queue":1,"max_queue":3}
+```
+
+### 示例 2：同秒多批按输入顺序先到先走
+
+整周期常绿（`green_start == green_end`）、每秒放 1 辆，第 0 秒同秒内先后到达两批
+（2 辆、3 辆）：严格按输入顺序放行，第 0 批最后一辆在第 1 秒通过、第 1 批最后一辆
+在第 4 秒通过，最大排队为到达后、放行前的 5 辆：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/queue-forecast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cycle": 5,
+    "offset": 0,
+    "green_start": 0,
+    "green_end": 0,
+    "forecast_from": 0,
+    "forecast_to": 6,
+    "discharge_per_second": 1,
+    "arrivals": [
+      {"arrival_time": 0, "count": 2},
+      {"arrival_time": 0, "count": 3}
+    ]
+  }'
+# {"pass_times":[1,4],"remaining_queue":0,"max_queue":5}
+```
+
+### 示例 3：跨零点绿灯，积压到下一段绿灯一次清空
+
+绿灯本地相位为 `[8,10) ∪ [0,2)`、`offset=5`（故绝对绿灯秒为 `t mod 10 ∈ {3,4,5,6}`），
+每秒可放 100 辆。两批车分别在第 9、11 秒到达时都遇红灯，共积压 2 辆（峰值 2）；
+下一段绿灯始于第 13 秒，两批在同一秒按 FIFO 一次清空，最后一辆通过秒均为 13：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/queue-forecast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cycle": 10,
+    "offset": 5,
+    "green_start": 8,
+    "green_end": 2,
+    "forecast_from": 0,
+    "forecast_to": 15,
+    "discharge_per_second": 100,
+    "arrivals": [
+      {"arrival_time": 9, "count": 1},
+      {"arrival_time": 11, "count": 1}
+    ]
+  }'
+# {"pass_times":[13,13],"remaining_queue":0,"max_queue":2}
+```
+
+### 排队预测的算法说明（批次计数，不逐辆展开）
+
+队列以**批次为节点**的双端队列推进：每个节点记录该批的**剩余车数**与其批次下标
+（期初队列用一个特殊节点表示，不产生输出）。每秒先把该秒到达的批次整体追加到队尾，
+随后绿灯秒从队首节点按车数扣减 `discharge_per_second`：
+
+- 放行能力不小于队首批剩余车数时整批弹出，记录该批最后一辆在**当秒**通过，剩余能力
+  继续消费下一批（一个绿灯秒可清空多批）；
+- 否则只扣减队首批的剩余车数，该批尚未完成、不写通过秒。
+
+队列总车数用一个随入队 / 放行增减的计数器维护，最大排队 O(1) 更新。全程入队与放行
+都按**批次计数**，单批 10⁹ 辆与 1 辆的运算量相同；主循环至多 86400 个模拟秒、队列
+节点至多 `1001` 个（1000 批 + 期初节点），最坏规模亚秒级完成。测试含 600 组随机
+参数（普通绿灯、跨零点、常绿、随机 offset、随机期初队列与同秒多批）下与**逐秒逐辆**
+FIFO 暴力模拟的逐项对照（逐批通过秒、期末待行数与最大排队数），并覆盖红灯不放行、
+跨批次部分放行、到达后放行前统计峰值、半开范围末端边界、范围不始于 0、周期 1 秒、
+86400 秒范围 + 1000 批性能等场景。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -1233,6 +1398,31 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 { "detail": ["roads[0].to 必须满足 0 <= to < 路口数（当前 3 个）"] }
 ```
 
+`/api/green-wave/queue-forecast` 的 422 校验：
+
+- `cycle ∈ [1, 86400]`、`discharge_per_second >= 1`、`initial_queue >= 0`、
+  `forecast_from >= 0`、每批 `count >= 1`（字段级 422）；
+- `0 <= offset / green_start / green_end < cycle`（跨字段 422；端点相等表示常绿，
+  合法）；
+- 预测范围必须满足 `forecast_to > forecast_from` 且长度
+  `forecast_to - forecast_from <= 86400`（跨字段 422）；
+- 每条 `arrivals[].arrival_time` 都必须落在半开预测范围
+  `[forecast_from, forecast_to)` **之内**，早于 `forecast_from`（含负数）或等于 /
+  晚于 `forecast_to` 均返回 422（错误信息带批次下标与时刻）；
+- `arrivals` 数量不超过 **1000**（字段级 422），允许为空数组或省略。
+
+```json
+{ "detail": ["arrivals[0].arrival_time = 10 必须落在预测范围 [0, 10) 内"] }
+```
+
+```json
+{ "detail": ["offset 必须满足 0 <= offset < cycle"] }
+```
+
+注意：批次在范围内**未全部放行**（排队溢出到 `forecast_to` 之后）属于业务结果而非
+请求错误，HTTP 状态码为 200，对应 `pass_times` 元素为 `null`、车辆计入
+`remaining_queue`（不会返回 422）。
+
 ## 算法说明（区间运算，不逐秒试探）
 
 1. **周期内展开与波动收缩**：每个路口的绿灯半开区间先展开为连续分量
@@ -1272,6 +1462,12 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 `O(班次数 × 每班候选数)`（上限 50 × 3600 次 O(1) 转移），不逐班贪心、不枚举时刻表
 组合。
 
+`/api/green-wave/queue-forecast` 与上述区间接口不同，模拟本身以整数秒为最小粒度
+（范围至多 86400 秒），但队列只以**批次为节点**（节点记录剩余车数与批次下标），
+入队整批追加、绿灯秒从队首按车数扣减（整批弹出或部分扣减），队列总车数与峰值
+O(1) 维护——**不逐辆展开**，单批 10⁹ 辆与 1 辆运算量相同。复杂度
+`O(范围秒数 + 批次数)`，86400 秒、1000 批的最坏规模亚秒级完成。
+
 ## 运行测试
 
 ```bash
@@ -1301,4 +1497,9 @@ pytest -q
 `(总成本, 时刻表元组)`）的逐项对照，并覆盖逐班贪心选最近点导致误判无解的
 陷阱用例、同成本字典序 tie-break（单班与多班联动）、容限 0、headway 顶破
 原时刻、半开绿灯 / 范围右端边界、跨零点绿灯、行驶时间波动收缩候选、50 班
-上界性能、无解返回 `null` 及 422 校验等场景。
+上界性能、无解返回 `null` 及 422 校验等场景；单路口排队预测
+另有 600 组随机参数（普通 / 跨零点 / 常绿绿灯、随机 offset、期初队列与同秒多批）
+下与逐秒逐辆 FIFO 暴力模拟的逐项对照（逐批通过秒、期末待行数、最大排队数），
+并覆盖红灯不放行、跨批次部分放行、峰值在到达后放行前统计、半开范围末端、
+范围不始于 0、周期 1 秒、86400 秒 + 1000 批性能及范围外到达 / 无效信号参数的
+422 校验等场景。

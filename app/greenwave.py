@@ -132,11 +132,25 @@ headway），故采用动态规划：正向 ``f_j(t) = |t-o_j| + min f_{j-1}(s)`
    一路口不晚于其 H 值"的道路中取下标最小者。不变式 t <= H(u, k) 保证
    每步必有可行道路、不会走入死路；E* 步后恰在 T* 到达终点，所得即
    (T*, E*) 路径中字典序最小者。
+
+单路口排队预测
+--------------
+:func:`compute_queue_forecast` 在单个路口、整数秒粒度的半开预测范围
+``[forecast_from, forecast_to)``（长度 1..86400）上模拟排队消散：期初已有
+``initial_queue`` 辆车排队，每秒先按输入顺序把该秒的到达批次（至多 1000 批，
+每批为正整数辆车，同秒可多批）整体入队，**再**判灯——绿灯秒放行
+``discharge_per_second`` 辆（红灯秒一辆不放），按队列先到先走顺序消费，可
+跨批次部分放行。每秒的最大排队数在"当秒到达后、放行前"统计。以**批次**为
+队列节点（节点记录剩余车数与该批最后一辆的通过秒），入队 / 放行均按批次
+计数，不逐辆展开；返回各批最后一辆的通过秒（范围内未全部通过为 ``None``）、
+期末待行车辆数与范围内最大排队数。信号相位、半开绿灯、跨零点与常绿语义与
+其余接口完全一致（本地相位 ``(t + offset) mod cycle``，绿灯起点含、终点不含）。
 """
 
 from __future__ import annotations
 
 import heapq
+from collections import deque
 from typing import Iterable
 
 # 周期上限仅用于防御异常输入，一日之内足够覆盖任何实际信号周期。
@@ -148,6 +162,8 @@ MAX_CONVOY_VEHICLES = 50
 MAX_RESCHEDULE_TRIPS = 50
 MAX_ROUTE_INTERSECTIONS = 30
 MAX_ROADS = 120
+MAX_QUEUE_FORECAST_SECONDS = 86_400
+MAX_ARRIVAL_BATCHES = 1_000
 
 Interval = list[int]  # 长度为 2 的半开区间 [start, end)
 
@@ -1200,3 +1216,112 @@ def compute_earliest_route(
         path.append(v)
         u = v
     return t, path
+
+
+# ---------- 单路口排队预测（queue forecast） ----------
+
+
+ArrivalBatch = tuple[int, int]  # (arrival_time, count)
+
+
+def is_green_at(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    time: int,
+) -> bool:
+    """绝对整数秒 time 处该路口是否绿灯。
+
+    相位约定与 :func:`departure_windows_for_intersection` 一致：
+    本地相位 ``(time + offset) mod cycle`` 落在绿灯半开区间内即绿灯；
+    ``green_start == green_end`` 为整周期常绿；跨零点绿灯
+    （``phase >= green_start or phase < green_end``）由取模自然处理。
+    """
+    if green_start == green_end:
+        return True
+    phase = (time + offset) % cycle
+    if green_start < green_end:
+        return green_start <= phase < green_end
+    return phase >= green_start or phase < green_end
+
+
+def compute_queue_forecast(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    forecast_from: int,
+    forecast_to: int,
+    discharge_per_second: int,
+    initial_queue: int,
+    arrivals: Iterable[ArrivalBatch],
+) -> tuple[list[int | None], int, int]:
+    """预测单路口在半开范围 ``[forecast_from, forecast_to)`` 内的排队消散。
+
+    信号参数沿用全局相位约定：本地相位 ``(t + offset) mod cycle``，绿灯为
+    半开区间（跨零点两段、端点相等为整周期常绿）。每秒按固定顺序推进：
+
+    1. **到达入队**：先按输入顺序把该秒的全部到达批次整体追加到队尾
+       （同秒多批保留先后次序，跨秒的批次之间亦不重排）；
+    2. **统计最大排队**：在到达之后、放行之前更新最大排队数；
+    3. **判灯放行**：绿灯秒按队列先到先走（FIFO）放行至多
+       ``discharge_per_second`` 辆，红灯秒一辆不放；放行可在批次中间截断，
+       某批最后一辆在秒 t 通过则该批结果为 t。
+
+    队列以**批次为节点**（节点记录批次剩余车数与其批次下标，期初队列用下标
+    ``None`` 标记），入队与放行都按批次计数（队首批次一次放行多辆、清空后弹到
+    下一批），不逐辆展开。范围内未全部放行的批次（含恰在 ``forecast_to`` 之后
+    才清空者）通过秒为 ``None``。期初队列先于任何到达批次接受放行，但其最后
+    一辆不在返回的逐批结果中。
+
+    返回 ``(各批最后一辆通过秒, 期末待行车辆数, 最大排队数)``：待行车辆数为
+    最后一秒放行结束后的队列总车数（含未完成批次）；最大排队数统计各秒
+    "到达后、放行前"的队列总车数（期初队列非空时至少为 ``initial_queue``）。
+    输入合法性（周期 / offset / 绿灯端点、范围长度、到达时刻均在范围内）
+    由请求侧 Pydantic 模型保证。
+    """
+    # 把到达按秒分桶：dict 保持插入顺序，同秒内保留输入批次次序。
+    by_second: dict[int, list[int]] = {}
+    batch_counts: list[int] = []
+    for arrival_time, count in arrivals:
+        by_second.setdefault(arrival_time, []).append(len(batch_counts))
+        batch_counts.append(count)
+
+    # 队首节点 [剩余车数, 批次下标]；下标 None 标记期初队列（不产生逐批输出）。
+    queue: deque[list] = deque()
+    queue_size = 0
+    if initial_queue:
+        queue.append([initial_queue, None])
+        queue_size = initial_queue
+
+    pass_times: list[int | None] = [None] * len(batch_counts)
+    max_queue = queue_size
+
+    for time in range(forecast_from, forecast_to):
+        # 1. 到达批次先入队（按输入顺序）。
+        for batch_index in by_second.get(time, ()):
+            queue.append([batch_counts[batch_index], batch_index])
+            queue_size += batch_counts[batch_index]
+        # 2. 最大排队数在当秒到达后、放行前统计。
+        max_queue = max(max_queue, queue_size)
+        # 3. 判灯放行：绿灯按 FIFO 至多放行 discharge_per_second 辆。
+        if queue and is_green_at(
+            cycle, offset, green_start, green_end, time
+        ):
+            capacity = discharge_per_second
+            while capacity > 0 and queue:
+                node = queue[0]
+                if node[0] <= capacity:
+                    capacity -= node[0]
+                    queue_size -= node[0]
+                    if node[1] is not None:
+                        # 该批最后一辆恰在本秒通过（部分放行可能发生在前几秒）。
+                        pass_times[node[1]] = time
+                    queue.popleft()
+                else:
+                    node[0] -= capacity
+                    queue_size -= capacity
+                    capacity = 0
+
+    return pass_times, queue_size, max_queue
