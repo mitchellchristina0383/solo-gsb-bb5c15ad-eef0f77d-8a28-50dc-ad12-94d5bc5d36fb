@@ -1,0 +1,18 @@
+services:
+  greenwave:
+    build: .
+    image: greenwave-api:latest
+    container_name: greenwave-api
+    ports:
+      # 宿主机 ${APP_PORT} -> 容器 8000
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      # 如需调整日志级别等可在此扩展
+      UVICORN_LOG_LEVEL: "${LOG_LEVEL:-info}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
